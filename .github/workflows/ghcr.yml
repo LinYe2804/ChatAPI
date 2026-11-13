@@ -1,0 +1,70 @@
+name: Build and publish GHCR image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set image name
+        id: image
+        shell: bash
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: chatapi:verify
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0-only
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name chatapi-smoke -p 127.0.0.1:15000:5000 \
+            -e CHATAPI_MASTER_KEY="$(openssl rand -base64 48)" \
+            -e CHATAPI_SESSION_SECRET="$(openssl rand -base64 48)" \
+            -e CHATAPI_ADMIN_PASSWORD="$(openssl rand -hex 24)" \
+            chatapi:verify
+          trap 'docker logs chatapi-smoke; docker rm -fv chatapi-smoke' EXIT
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:15000/api/ready; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:15000/api/ready
+          curl -fsS http://127.0.0.1:15000/ -o /tmp/chatapi-index.html
+          grep -qi '<html' /tmp/chatapi-index.html
+          docker exec chatapi-smoke migrate-db --help
+      - name: Sign in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push verified image
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          set -euo pipefail
+          docker tag chatapi:verify "$IMAGE:latest"
+          docker tag chatapi:verify "$IMAGE:sha-${GITHUB_SHA::12}"
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:sha-${GITHUB_SHA::12}"
+          docker buildx imagetools inspect "$IMAGE:latest"
+          echo "Published: $IMAGE:latest and $IMAGE:sha-${GITHUB_SHA::12}" >> "$GITHUB_STEP_SUMMARY"
